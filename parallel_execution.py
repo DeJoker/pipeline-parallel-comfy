@@ -12,8 +12,13 @@ import nodes
 
 import comfy.model_management
 import execution
+from server import PromptServer
+
+
 
 def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui, object_storage):
+    client_id = extra_data["client_id"]
+
     unique_id = current_item
     inputs = prompt[unique_id]['inputs']
     class_type = prompt[unique_id]['class_type']
@@ -36,9 +41,9 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
     input_data_all = None
     try:
         input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
-        if server.client_id is not None:
-            server.last_node_id = unique_id
-            server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, server.client_id)
+        # if client_id is not None:
+        #     server.last_node_id = unique_id
+        #     server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
 
         obj = object_storage.get((unique_id, class_type), None)
         if obj is None:
@@ -47,9 +52,9 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
 
         output_data, output_ui = execution.get_output_data(obj, input_data_all)
         outputs[unique_id] = output_data
-        if len(output_ui) > 0:
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+        # if len(output_ui) > 0:
+        #     if client_id is not None:
+        #         server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
     except comfy.model_management.InterruptProcessingException as iex:
         logging.info("Processing interrupted")
 
@@ -89,81 +94,6 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
 
     return (True, None, None)
 
-def recursive_will_execute(prompt, workflow_outputs, current_item, memo={}):
-    unique_id = current_item
-
-    if unique_id in memo:
-        return memo[unique_id]
-
-    inputs = prompt[unique_id]['inputs']
-    will_execute = []
-    if unique_id in workflow_outputs:
-        return []
-
-    for x in inputs:
-        input_data = inputs[x]
-        if isinstance(input_data, list):
-            input_unique_id = input_data[0]
-            output_index = input_data[1]
-            if input_unique_id not in workflow_outputs:
-                will_execute += recursive_will_execute(prompt, workflow_outputs, input_unique_id, memo)
-
-    memo[unique_id] = will_execute + [unique_id]
-    return memo[unique_id]
-
-def recursive_output_delete_if_changed(prompt, old_prompt, workflow_outputs, current_item):
-    unique_id = current_item
-    inputs = prompt[unique_id]['inputs']
-    class_type = prompt[unique_id]['class_type']
-    class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-
-    is_changed_old = ''
-    is_changed = ''
-    to_delete = False
-    if hasattr(class_def, 'IS_CHANGED'):
-        if unique_id in old_prompt and 'is_changed' in old_prompt[unique_id]:
-            is_changed_old = old_prompt[unique_id]['is_changed']
-        if 'is_changed' not in prompt[unique_id]:
-            input_data_all = execution.get_input_data(inputs, class_def, unique_id, workflow_outputs)
-            if input_data_all is not None:
-                try:
-                    #is_changed = class_def.IS_CHANGED(**input_data_all)
-                    is_changed = execution.map_node_over_list(class_def, input_data_all, "IS_CHANGED")
-                    prompt[unique_id]['is_changed'] = is_changed
-                except:
-                    to_delete = True
-        else:
-            is_changed = prompt[unique_id]['is_changed']
-
-    if unique_id not in workflow_outputs:
-        return True
-
-    if not to_delete:
-        if is_changed != is_changed_old:
-            to_delete = True
-        elif unique_id not in old_prompt:
-            to_delete = True
-        elif inputs == old_prompt[unique_id]['inputs']:
-            for x in inputs:
-                input_data = inputs[x]
-
-                if isinstance(input_data, list):
-                    input_unique_id = input_data[0]
-                    output_index = input_data[1]
-                    if input_unique_id in workflow_outputs:
-                        to_delete = recursive_output_delete_if_changed(prompt, old_prompt, workflow_outputs, input_unique_id)
-                    else:
-                        to_delete = True
-                    if to_delete:
-                        break
-        else:
-            to_delete = True
-
-    if to_delete:
-        d = workflow_outputs.pop(unique_id)
-        del d
-    return to_delete
-
 class PromptExecutor:
     def __init__(self, server):
         self.server = server
@@ -172,7 +102,7 @@ class PromptExecutor:
     def reset(self):
         # 二维Dict {workflow_name1:{}, workflow_name2:{}}
         self.outputs = {}
-        self.object_storage = {}
+        self.object_storages = {}
         self.old_prompts = {}
 
         # self.outputs_ui = {} # Not use
@@ -184,7 +114,7 @@ class PromptExecutor:
         if client_id is not None or broadcast:
             self.server.send_sync(event, data, client_id)
 
-    def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex, client_id, outputs):
+    def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex, client_id, outputs, workflow_old_prompt):
         node_id = error["node_id"]
         class_type = prompt[node_id]["class_type"]
 
@@ -218,8 +148,8 @@ class PromptExecutor:
         for o in outputs:
             if (o not in current_outputs) and (o not in executed):
                 to_delete += [o]
-                if o in self.old_prompt:
-                    d = self.old_prompt.pop(o)
+                if o in workflow_old_prompt:
+                    d = workflow_old_prompt.pop(o)
                     del d
         for o in to_delete:
             d = outputs.pop(o)
@@ -233,7 +163,11 @@ class PromptExecutor:
 
         if workflow_name not in self.outputs:
             self.outputs[workflow_name] = {}
+            self.object_storages[workflow_name] = {}
+            self.old_prompts[workflow_name] = {}
         workflow_outputs = self.outputs[workflow_name]
+        workflow_object_storage = self.object_storages[workflow_name]
+        workflow_old_prompt = self.old_prompts[workflow_name]
 
 
         # self.status_messages = []
@@ -261,7 +195,7 @@ class PromptExecutor:
                 del d
 
             for x in prompt:
-                recursive_output_delete_if_changed(prompt, self.old_prompt, workflow_outputs, x)
+                execution.recursive_output_delete_if_changed(prompt, workflow_old_prompt, workflow_outputs, x)
 
             current_outputs = set(workflow_outputs.keys())
             # for x in list(self.outputs_ui.keys()):
@@ -283,20 +217,20 @@ class PromptExecutor:
             while len(to_execute) > 0:
                 #always execute the output that depends on the least amount of unexecuted nodes first
                 memo = {}
-                to_execute = sorted(list(map(lambda a: (len(recursive_will_execute(prompt, workflow_outputs, a[-1], memo)), a[-1]), to_execute)))
+                to_execute = sorted(list(map(lambda a: (len(execution.recursive_will_execute(prompt, workflow_outputs, a[-1], memo)), a[-1]), to_execute)))
                 output_node_id = to_execute.pop(0)[-1]
 
                 # This call shouldn't raise anything if there's an error deep in
                 # the actual SD code, instead it will report the node where the
                 # error was raised
-                success, error, ex = recursive_output_delete_if_changed(self.server, prompt, workflow_outputs, output_node_id, extra_data, executed, prompt_id, self.outputs_ui, self.object_storage)
+                success, error, ex = pipeline_parallel_recursive_execute(self.server, prompt, workflow_outputs, output_node_id, extra_data, executed, prompt_id, self.outputs_ui, workflow_object_storage)
                 if success is not True:
-                    self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex, client_id, workflow_outputs)
+                    self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex, client_id, workflow_outputs, workflow_old_prompt)
                     break
 
             for x in executed:
-                self.old_prompt[x] = copy.deepcopy(prompt[x])
-            self.server.last_node_id = None
+                workflow_old_prompt[x] = copy.deepcopy(prompt[x])
+            # self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 comfy.model_management.unload_all_models()
 
@@ -305,8 +239,8 @@ class PromptExecutor:
 MAXIMUM_HISTORY_SIZE = 10000
 
 class PromptQueue:
-    def __init__(self, server):
-        self.server = server
+    def __init__(self, server: PromptServer):
+        # self.server = server
         self.mutex = threading.RLock()
         self.not_empty = threading.Condition(self.mutex)
         self.task_counter = 0
@@ -314,13 +248,13 @@ class PromptQueue:
         self.currently_running = {}
         self.history = {}
         self.flags = {}
-        server.prompt_queue = self
+        # server.prompt_queue = self
 
     def put(self, workflow_name, item):
         with self.mutex:
             queue = self.workflow_queue[workflow_name]
             heapq.heappush(queue, item)
-            self.server.queue_updated()
+            # self.server.queue_updated()
             self.not_empty.notify()
 
     def get(self, workflow_name, timeout=None):
@@ -334,7 +268,7 @@ class PromptQueue:
             i = self.task_counter
             self.currently_running[i] = copy.deepcopy(item)
             self.task_counter += 1
-            self.server.queue_updated()
+            # self.server.queue_updated()
             return (item, i)
 
     class ExecutionStatus(NamedTuple):
@@ -358,7 +292,7 @@ class PromptQueue:
                 "outputs": copy.deepcopy(outputs),
                 'status': status_dict,
             }
-            self.server.queue_updated()
+            # self.server.queue_updated()
 
     # def get_current_queue(self):
     #     pass
@@ -412,3 +346,7 @@ class PromptQueue:
                 return ret
             else:
                 return self.flags.copy()
+
+parallel_prompt_queue = PromptQueue()
+
+
