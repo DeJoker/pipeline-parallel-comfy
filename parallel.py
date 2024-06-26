@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, Future
 
 from server import PromptServer
 import execution
+from . import parallel_execution
 import nodes
-import main
 import comfy.model_management
 
 routes = PromptServer.instance.routes
@@ -96,7 +96,7 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
 
     return (True, None, None)
 
-def execute_hook(e: execution.PromptExecutor, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+def execute_hook(e: parallel_execution.PromptExecutor, prompt, prompt_id, extra_data={}, execute_outputs=[]):
     execution_start_time = time.perf_counter()
     e.execute(prompt, prompt_id, extra_data, execute_outputs)
     current_time = time.perf_counter()
@@ -104,10 +104,10 @@ def execute_hook(e: execution.PromptExecutor, prompt, prompt_id, extra_data={}, 
     logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
     
 
-def prompt_worker(q: execution.PromptQueue, server: PromptServer):
+def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
     parallelExecutor = ThreadPoolExecutor(max_worker=12)
 
-    e = execution.PromptExecutor(server)
+    e = parallel_execution.PromptExecutor(server)
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
@@ -128,7 +128,7 @@ def prompt_worker(q: execution.PromptQueue, server: PromptServer):
             def done_cb(_future: Future, extra_data = item[3], item_id=item_id):
                 q.task_done(item_id,
                             e.outputs_ui,
-                            status=execution.PromptQueue.ExecutionStatus(
+                            status=parallel_execution.PromptQueue.ExecutionStatus(
                                 status_str='success' if e.success else 'error',
                                 completed=e.success,
                                 messages=e.status_messages))
@@ -159,12 +159,4 @@ def prompt_worker(q: execution.PromptQueue, server: PromptServer):
                     comfy.model_management.soft_empty_cache()
                     last_gc_collect = current_time
                     need_gc = False
-
-
-
-# execution.pipeline_parallel_recursive_execute = execution.PromptExecutor.recursive_execute
-execution.recursive_execute = pipeline_parallel_recursive_execute
-
-main_prompt_worker = main.prompt_worker
-main.prompt_worker = prompt_worker
 
