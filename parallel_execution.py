@@ -98,6 +98,12 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
 
     return (True, None, None)
 
+def shallow_copy(x: dict):
+    c = {}
+    for k,v in x.items():
+        c[k] = v
+    return c
+
 class PromptExecutor:
     def __init__(self, server: PromptServer):
         self.server = server
@@ -218,6 +224,10 @@ class PromptExecutor:
                     execution.recursive_output_delete_if_changed(prompt, workflow_old_prompt, workflow_outputs, x)
 
                 current_outputs = set(workflow_outputs.keys())
+                # shallow copy current output for recursive_will_execute can do right way
+                # and avoid data competition
+                prompt_outout = shallow_copy(workflow_outputs) 
+
             with self.cleanup_lock:
                 comfy.model_management.cleanup_models(keep_clone_weights_loaded=True)
 
@@ -231,7 +241,7 @@ class PromptExecutor:
             for node_id in list(execute_outputs):
                 to_execute += [(0, node_id)]
 
-            prompt_outout = copy.deepcopy(workflow_outputs)
+            
             outputs_ui = {}
             while len(to_execute) > 0:
                 #always execute the output that depends on the least amount of unexecuted nodes first
@@ -249,6 +259,9 @@ class PromptExecutor:
                     self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex, client_id, workflow_outputs, workflow_old_prompt)
                     break
 
+            with self.locks[workflow_name]["workflow_lock"]:
+                self.outputs[workflow_name] = prompt_outout
+            
             for x in executed:
                 workflow_old_prompt[x] = copy.deepcopy(prompt[x])
             # self.server.last_node_id = None
