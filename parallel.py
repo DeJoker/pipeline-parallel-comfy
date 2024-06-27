@@ -21,14 +21,16 @@ server_instance = PromptServer.instance
 
 def execute_hook(e: parallel_execution.PromptExecutor, prompt, prompt_id, extra_data={}, execute_outputs=[]):
     execution_start_time = time.perf_counter()
-    e.execute(prompt, prompt_id, extra_data, execute_outputs)
+    prompt_outout, outputs_ui = e.execute(prompt, prompt_id, extra_data, execute_outputs)
     current_time = time.perf_counter()
     execution_time = current_time - execution_start_time
     logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
+    return prompt_outout, outputs_ui
     
 
 def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
-    parallelExecutor = ThreadPoolExecutor(max_workers=12)
+    server.last_prompt_id = '' # add PromptServer attribute when UI or /prompt not do it
+    parallelExecutor = ThreadPoolExecutor(max_workers=4)
 
     e = parallel_execution.PromptExecutor(server)
     last_gc_collect = 0
@@ -46,11 +48,18 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
             prompt_id = item[1]
             server.last_prompt_id = prompt_id
 
+            first_workflow_prompt = True
+            workflow_name = item[3]["workflow_name"]
+            if workflow_name in e.outputs:
+                first_workflow_prompt = False
+
             future = parallelExecutor.submit(execute_hook, e, item[2], prompt_id, item[3], item[4])
         
-            def done_cb(_future: Future, extra_data = item[3], item_id=item_id):
+            def done_cb(_future: Future, prompt_id=item[1], extra_data = item[3], item_id=item_id):
+                prompt_outout, outputs_ui = _future.result()
+                logging.info(f"done_cb {prompt_id}")
                 q.task_done(item_id,
-                            {},
+                            outputs_ui,
                             status=parallel_execution.PromptQueue.ExecutionStatus(
                                 status_str='success' if e.success else 'error',
                                 completed=e.success,
@@ -58,6 +67,10 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
                 if extra_data.get("client_id") is not None:
                     server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, extra_data.get("client_id"))
             future.add_done_callback(done_cb)
+            if first_workflow_prompt:
+                future.result() # first prompt wait for it
+        
+            logging.info(f"currently_running:{len(q.currently_running)}")
 
         if len(q.currently_running) == 0:
             need_gc = True

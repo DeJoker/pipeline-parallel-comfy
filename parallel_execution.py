@@ -55,9 +55,10 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
 
             output_data, output_ui = execution.get_output_data(obj, input_data_all)
             outputs[unique_id] = output_data
-        # if len(output_ui) > 0:
-        #     if client_id is not None:
-        #         server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+        if len(output_ui) > 0:
+            outputs_ui[unique_id] = output_ui
+            if client_id is not None:
+                server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
     except comfy.model_management.InterruptProcessingException as iex:
         logging.info("Processing interrupted")
 
@@ -98,23 +99,33 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
     return (True, None, None)
 
 class PromptExecutor:
-    def __init__(self, server):
+    def __init__(self, server: PromptServer):
         self.server = server
         self.reset()
 
     def reset(self):
-        # 二维Dict {workflow_name1:{}, workflow_name2:{}}
+        # Dict {workflow_name1:{}, workflow_name2:{}}
         self.outputs = {}
         self.object_storages = {}
         self.old_prompts = {}
+        self.cleanup_lock = threading.Lock()
         self.locks = {}
 
         self.outputs_ui = {} # Not use
-        # self.status_messages = [] # Not use
-        # self.success = True # use local varabile
+
+        self.status_messages = {} # promptid to message list
+        self.success = {} # promptid to message list
+    
+    def clean_end_execution(self, prompt_id):
+        self.status_messages.pop(prompt_id)
+        self.success.pop(prompt_id)
+        
 
     def add_message(self, event, data, broadcast: bool, client_id):
-        # self.status_messages.append((event, data))
+        prompt_id = data["prompt_id"]
+        if prompt_id not in self.status_messages:
+            self.status_messages[prompt_id] = []
+        self.status_messages[prompt_id].append((event, data))
         if client_id is not None or broadcast:
             self.server.send_sync(event, data, client_id)
 
@@ -164,14 +175,15 @@ class PromptExecutor:
 
         client_id = extra_data["client_id"]
         workflow_name = extra_data["workflow_name"]
-        logging.info(f"execute {workflow_name} {client_id}")
+        logging.info(f"execute {workflow_name} {prompt_id} {client_id}")
 
         if workflow_name not in self.outputs:
             self.outputs[workflow_name] = {}
             self.object_storages[workflow_name] = {}
             self.old_prompts[workflow_name] = {}
             self.locks[workflow_name] = {}
-        workflow_outputs = self.outputs[workflow_name]
+            self.locks[workflow_name]["workflow_lock"] = threading.Lock()
+            
         workflow_object_storage = self.object_storages[workflow_name]
         workflow_old_prompt = self.old_prompts[workflow_name]
         workflow_lock = self.locks[workflow_name]
@@ -180,36 +192,35 @@ class PromptExecutor:
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False, client_id=client_id)
 
         with torch.inference_mode():
-            #delete cached outputs if nodes don't exist for them
-            to_delete = []
-            for o in workflow_outputs:
-                if o not in prompt:
-                    to_delete += [o]
-            for o in to_delete:
-                d = workflow_outputs.pop(o)
-                del d
-            to_delete = []
-            for o in workflow_object_storage:
-                if o[0] not in prompt:
-                    to_delete += [o]
-                else:
-                    p = prompt[o[0]]
-                    if o[1] != p['class_type']:
+            with self.locks[workflow_name]["workflow_lock"]:
+                workflow_outputs = self.outputs[workflow_name]
+                #delete cached outputs if nodes don't exist for them
+                to_delete = []
+                for o in workflow_outputs:
+                    if o not in prompt:
                         to_delete += [o]
-            for o in to_delete:
-                d = workflow_object_storage.pop(o)
-                del d
+                for o in to_delete:
+                    d = workflow_outputs.pop(o)
+                    del d
+                to_delete = []
+                for o in workflow_object_storage:
+                    if o[0] not in prompt:
+                        to_delete += [o]
+                    else:
+                        p = prompt[o[0]]
+                        if o[1] != p['class_type']:
+                            to_delete += [o]
+                for o in to_delete:
+                    d = workflow_object_storage.pop(o)
+                    del d
 
-            for x in prompt:
-                execution.recursive_output_delete_if_changed(prompt, workflow_old_prompt, workflow_outputs, x)
+                for x in prompt:
+                    execution.recursive_output_delete_if_changed(prompt, workflow_old_prompt, workflow_outputs, x)
 
-            current_outputs = set(workflow_outputs.keys())
-            # for x in list(self.outputs_ui.keys()):
-            #     if x not in current_outputs:
-            #         d = self.outputs_ui.pop(x)
-            #         del d
+                current_outputs = set(workflow_outputs.keys())
+            with self.cleanup_lock:
+                comfy.model_management.cleanup_models(keep_clone_weights_loaded=True)
 
-            comfy.model_management.cleanup_models(keep_clone_weights_loaded=True)
             self.add_message("execution_cached",
                           { "nodes": list(current_outputs) , "prompt_id": prompt_id},
                           broadcast=False, client_id=client_id,)
@@ -220,18 +231,21 @@ class PromptExecutor:
             for node_id in list(execute_outputs):
                 to_execute += [(0, node_id)]
 
+            prompt_outout = copy.deepcopy(workflow_outputs)
+            outputs_ui = {}
             while len(to_execute) > 0:
                 #always execute the output that depends on the least amount of unexecuted nodes first
                 memo = {}
-                to_execute = sorted(list(map(lambda a: (len(execution.recursive_will_execute(prompt, workflow_outputs, a[-1], memo)), a[-1]), to_execute)))
+                to_execute = sorted(list(map(lambda a: (len(execution.recursive_will_execute(prompt, prompt_outout, a[-1], memo)), a[-1]), to_execute)))
                 output_node_id = to_execute.pop(0)[-1]
 
                 # This call shouldn't raise anything if there's an error deep in
                 # the actual SD code, instead it will report the node where the
                 # error was raised
-                success, error, ex = pipeline_parallel_recursive_execute(self.server, prompt, workflow_outputs, output_node_id, extra_data, executed, prompt_id, 
-                                                                         outputs_ui={}, object_storage=workflow_object_storage, workflow_lock=workflow_lock)
-                if success is not True:
+                success, error, ex = pipeline_parallel_recursive_execute(self.server, prompt, prompt_outout, output_node_id, extra_data, executed, prompt_id, 
+                                                                         outputs_ui, object_storage=workflow_object_storage, workflow_lock=workflow_lock)
+                self.success[prompt_id] = success
+                if not success:
                     self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex, client_id, workflow_outputs, workflow_old_prompt)
                     break
 
@@ -239,8 +253,9 @@ class PromptExecutor:
                 workflow_old_prompt[x] = copy.deepcopy(prompt[x])
             # self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
-                comfy.model_management.unload_all_models()
-        return success, error, ex
+                with self.cleanup_lock:
+                    comfy.model_management.unload_all_models()
+        return prompt_outout, outputs_ui
 
 
 
