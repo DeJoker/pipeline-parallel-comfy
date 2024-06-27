@@ -11,6 +11,7 @@ from aiohttp import web
 
 
 from server import PromptServer
+server_inst = PromptServer.instance
 routes = PromptServer.instance.routes
 
 from .parallel_execution import parallel_prompt_queue
@@ -50,3 +51,45 @@ async def post_prompt(request):
     else:
         print("invalid prompt:", valid[1])
         return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
+
+
+@routes.get("/parallel/history/{prompt_id}")
+async def get_history(request):
+    prompt_id = request.match_info.get("prompt_id", None)
+    return web.json_response(parallel_prompt_queue.get_history(prompt_id=prompt_id))
+
+
+@routes.get("/parallel/history")
+async def get_history(request):
+    max_items = request.rel_url.query.get("max_items", None)
+    if max_items is not None:
+        max_items = int(max_items)
+    return web.json_response(parallel_prompt_queue.get_history(max_items=max_items))
+
+
+@routes.get('/parallel/ws')
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    sid = request.rel_url.query.get('clientId', '')
+    if sid:
+        # Reusing existing session, remove old
+        server_inst.sockets.pop(sid, None)
+    else:
+        sid = uuid.uuid4().hex
+
+    server_inst.sockets[sid] = ws
+
+    try:
+        # Send initial state to the new client
+        await server_inst.send("status", { "status": server_inst.get_queue_info(), 'sid': sid }, sid)
+        # On reconnect if we are the currently executing client send the current node
+        # if self.client_id == sid and self.last_node_id is not None:
+        #     await self.send("executing", { "node": self.last_node_id }, sid)
+            
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.ERROR:
+                print('ws connection closed with exception %s' % ws.exception())
+    finally:
+        server_inst.sockets.pop(sid, None)
+    return ws

@@ -16,7 +16,7 @@ from server import PromptServer
 
 
 
-def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui, object_storage):
+def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui, object_storage, workflow_lock):
     client_id = extra_data["client_id"]
 
     unique_id = current_item
@@ -33,25 +33,28 @@ def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, e
             input_unique_id = input_data[0]
             output_index = input_data[1]
             if input_unique_id not in outputs:
-                result = pipeline_parallel_recursive_execute(server, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, object_storage)
+                result = pipeline_parallel_recursive_execute(server, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, object_storage, workflow_lock)
                 if result[0] is not True:
                     # Another node failed further upstream
                     return result
 
     input_data_all = None
     try:
-        input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
-        # if client_id is not None:
-        #     server.last_node_id = unique_id
-        #     server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
+        if current_item not in workflow_lock:
+            workflow_lock[current_item] = threading.Lock()
+        with workflow_lock[current_item]:
+            input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
+            # if client_id is not None:
+            #     server.last_node_id = unique_id
+            #     server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
 
-        obj = object_storage.get((unique_id, class_type), None)
-        if obj is None:
-            obj = class_def()
-            object_storage[(unique_id, class_type)] = obj
+            obj = object_storage.get((unique_id, class_type), None)
+            if obj is None:
+                obj = class_def()
+                object_storage[(unique_id, class_type)] = obj
 
-        output_data, output_ui = execution.get_output_data(obj, input_data_all)
-        outputs[unique_id] = output_data
+            output_data, output_ui = execution.get_output_data(obj, input_data_all)
+            outputs[unique_id] = output_data
         # if len(output_ui) > 0:
         #     if client_id is not None:
         #         server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
@@ -104,8 +107,9 @@ class PromptExecutor:
         self.outputs = {}
         self.object_storages = {}
         self.old_prompts = {}
+        self.locks = {}
 
-        # self.outputs_ui = {} # Not use
+        self.outputs_ui = {} # Not use
         # self.status_messages = [] # Not use
         # self.success = True # use local varabile
 
@@ -127,7 +131,7 @@ class PromptExecutor:
                 "node_type": class_type,
                 "executed": list(executed),
             }
-            self.add_message("execution_interrupted", mes, broadcast=True, client_id=client_id)
+            self.add_message("execution_interrupted", mes, broadcast=False, client_id=client_id)
         else:
             mes = {
                 "prompt_id": prompt_id,
@@ -160,15 +164,17 @@ class PromptExecutor:
 
         client_id = extra_data["client_id"]
         workflow_name = extra_data["workflow_name"]
+        logging.info(f"execute {workflow_name} {client_id}")
 
         if workflow_name not in self.outputs:
             self.outputs[workflow_name] = {}
             self.object_storages[workflow_name] = {}
             self.old_prompts[workflow_name] = {}
+            self.locks[workflow_name] = {}
         workflow_outputs = self.outputs[workflow_name]
         workflow_object_storage = self.object_storages[workflow_name]
         workflow_old_prompt = self.old_prompts[workflow_name]
-
+        workflow_lock = self.locks[workflow_name]
 
         # self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False, client_id=client_id)
@@ -183,7 +189,7 @@ class PromptExecutor:
                 d = workflow_outputs.pop(o)
                 del d
             to_delete = []
-            for o in self.object_storage:
+            for o in workflow_object_storage:
                 if o[0] not in prompt:
                     to_delete += [o]
                 else:
@@ -191,7 +197,7 @@ class PromptExecutor:
                     if o[1] != p['class_type']:
                         to_delete += [o]
             for o in to_delete:
-                d = self.object_storage.pop(o)
+                d = workflow_object_storage.pop(o)
                 del d
 
             for x in prompt:
@@ -223,7 +229,8 @@ class PromptExecutor:
                 # This call shouldn't raise anything if there's an error deep in
                 # the actual SD code, instead it will report the node where the
                 # error was raised
-                success, error, ex = pipeline_parallel_recursive_execute(self.server, prompt, workflow_outputs, output_node_id, extra_data, executed, prompt_id, self.outputs_ui, workflow_object_storage)
+                success, error, ex = pipeline_parallel_recursive_execute(self.server, prompt, workflow_outputs, output_node_id, extra_data, executed, prompt_id, 
+                                                                         outputs_ui={}, object_storage=workflow_object_storage, workflow_lock=workflow_lock)
                 if success is not True:
                     self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex, client_id, workflow_outputs, workflow_old_prompt)
                     break
@@ -233,13 +240,14 @@ class PromptExecutor:
             # self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 comfy.model_management.unload_all_models()
+        return success, error, ex
 
 
 
 MAXIMUM_HISTORY_SIZE = 10000
 
 class PromptQueue:
-    def __init__(self, server: PromptServer):
+    def __init__(self):
         # self.server = server
         self.mutex = threading.RLock()
         self.not_empty = threading.Condition(self.mutex)
@@ -252,24 +260,27 @@ class PromptQueue:
 
     def put(self, workflow_name, item):
         with self.mutex:
+            if workflow_name not in self.workflow_queue:
+                self.workflow_queue[workflow_name] = []
             queue = self.workflow_queue[workflow_name]
             heapq.heappush(queue, item)
             # self.server.queue_updated()
             self.not_empty.notify()
 
-    def get(self, workflow_name, timeout=None):
+    def get(self, timeout=None):
         with self.not_empty:
-            queue = self.workflow_queue[workflow_name]
-            while len(queue) == 0:
-                self.not_empty.wait(timeout=timeout)
-                if timeout is not None and len(queue) == 0:
-                    return None
-            item = heapq.heappop(queue)
-            i = self.task_counter
-            self.currently_running[i] = copy.deepcopy(item)
-            self.task_counter += 1
-            # self.server.queue_updated()
-            return (item, i)
+            for workflow_name, queue in self.workflow_queue.items():
+                # queue = self.workflow_queue[workflow_name]
+                while len(queue) == 0:
+                    self.not_empty.wait(timeout=timeout)
+                    if timeout is not None and len(queue) == 0:
+                        return None
+                item = heapq.heappop(queue)
+                i = self.task_counter
+                self.currently_running[i] = copy.deepcopy(item)
+                self.task_counter += 1
+                # self.server.queue_updated()
+                return (item, i)
 
     class ExecutionStatus(NamedTuple):
         status_str: Literal['success', 'error']
