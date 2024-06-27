@@ -22,7 +22,7 @@ number = 0
 async def post_prompt(request):
     print("got prompt")
     resp_code = 200
-    json_data =  await request.json()
+    json_data = await request.json()
 
     global number
     number += 1
