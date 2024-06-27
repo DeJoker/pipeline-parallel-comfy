@@ -3,6 +3,7 @@ import json
 import logging
 import queue
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -18,84 +19,6 @@ import comfy.model_management
 routes = PromptServer.instance.routes
 server_instance = PromptServer.instance
 
-# def pipeline_parallel_recursive_execute(server_instance, *args, **kwargs):
-def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui, object_storage):
-    unique_id = current_item
-    inputs = prompt[unique_id]['inputs']
-    class_type = prompt[unique_id]['class_type']
-    class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-    if unique_id in outputs:
-        return (True, None, None)
-
-    for x in inputs:
-        input_data = inputs[x]
-
-        if isinstance(input_data, list):
-            input_unique_id = input_data[0]
-            output_index = input_data[1]
-            if input_unique_id not in outputs:
-                result = pipeline_parallel_recursive_execute(server, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, object_storage)
-                if result[0] is not True:
-                    # Another node failed further upstream
-                    return result
-
-    input_data_all = None
-    try:
-        input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
-        if server.client_id is not None:
-            server.last_node_id = unique_id
-            server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, server.client_id)
-
-        obj = object_storage.get((unique_id, class_type), None)
-        if obj is None:
-            obj = class_def()
-            object_storage[(unique_id, class_type)] = obj
-
-        output_data, output_ui = execution.get_output_data(obj, input_data_all)
-        outputs[unique_id] = output_data
-        if len(output_ui) > 0:
-            outputs_ui[unique_id] = output_ui
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
-    except comfy.model_management.InterruptProcessingException as iex:
-        logging.info("Processing interrupted")
-
-        # skip formatting inputs/outputs
-        error_details = {
-            "node_id": unique_id,
-        }
-
-        return (False, error_details, iex)
-    except Exception as ex:
-        typ, _, tb = sys.exc_info()
-        exception_type = execution.full_type_name(typ)
-        input_data_formatted = {}
-        if input_data_all is not None:
-            input_data_formatted = {}
-            for name, inputs in input_data_all.items():
-                input_data_formatted[name] = [execution.format_value(x) for x in inputs]
-
-        output_data_formatted = {}
-        for node_id, node_outputs in outputs.items():
-            output_data_formatted[node_id] = [[execution.format_value(x) for x in l] for l in node_outputs]
-
-        logging.error(f"!!! Exception during processing!!! {ex}")
-        logging.error(traceback.format_exc())
-
-        error_details = {
-            "node_id": unique_id,
-            "exception_message": str(ex),
-            "exception_type": exception_type,
-            "traceback": traceback.format_tb(tb),
-            "current_inputs": input_data_formatted,
-            "current_outputs": output_data_formatted
-        }
-        return (False, error_details, ex)
-
-    executed.add(unique_id)
-
-    return (True, None, None)
-
 def execute_hook(e: parallel_execution.PromptExecutor, prompt, prompt_id, extra_data={}, execute_outputs=[]):
     execution_start_time = time.perf_counter()
     e.execute(prompt, prompt_id, extra_data, execute_outputs)
@@ -105,7 +28,7 @@ def execute_hook(e: parallel_execution.PromptExecutor, prompt, prompt_id, extra_
     
 
 def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
-    parallelExecutor = ThreadPoolExecutor(max_worker=12)
+    parallelExecutor = ThreadPoolExecutor(max_workers=12)
 
     e = parallel_execution.PromptExecutor(server)
     last_gc_collect = 0
@@ -113,7 +36,7 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
     gc_collect_interval = 10.0
 
     while True:
-        timeout = 1.0
+        timeout = 1000.0
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
 
@@ -127,7 +50,7 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
         
             def done_cb(_future: Future, extra_data = item[3], item_id=item_id):
                 q.task_done(item_id,
-                            e.outputs_ui,
+                            {},
                             status=parallel_execution.PromptQueue.ExecutionStatus(
                                 status_str='success' if e.success else 'error',
                                 completed=e.success,
@@ -160,3 +83,37 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
                     last_gc_collect = current_time
                     need_gc = False
 
+
+threading.Thread(target=prompt_worker, 
+                    args=(parallel_execution.parallel_prompt_queue, PromptServer.instance,),
+                    daemon=True, 
+                ).start()
+
+
+
+class PipelineParallel:
+    def __init__(self):
+        self.type = "output"
+
+    @classmethod
+    def INPUT_TYPES(self):
+        return {
+            "required": {
+                "executor_count": ("INT", )
+            },
+            "optional": {
+            }
+        }
+
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
+    FUNCTION = 'set_parallel_config'
+    CATEGORY = 'parallel'
+    OUTPUT_NODE = True
+
+    def set_parallel_config(self, executor_count):
+        return { "ui": { "executor_count": [executor_count] } }
+    
+NODE_CLASS_MAPPINGS = {
+    "PipelineParallel": PipelineParallel
+}
