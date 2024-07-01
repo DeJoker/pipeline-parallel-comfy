@@ -3,6 +3,7 @@ import copy
 import logging
 import threading
 import heapq
+import time
 import traceback
 import inspect
 from typing import List, Literal, NamedTuple, Optional
@@ -15,94 +16,6 @@ import execution
 from server import PromptServer
 
 
-
-def pipeline_parallel_recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui, object_storage, workflow_lock):
-    client_id = extra_data["client_id"]
-
-    unique_id = current_item
-    inputs = prompt[unique_id]['inputs']
-    class_type = prompt[unique_id]['class_type']
-    class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-    if unique_id in outputs:
-        return (True, None, None)
-
-    for x in inputs:
-        input_data = inputs[x]
-
-        if isinstance(input_data, list):
-            input_unique_id = input_data[0]
-            output_index = input_data[1]
-            if input_unique_id not in outputs:
-                result = pipeline_parallel_recursive_execute(server, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, object_storage, workflow_lock)
-                if result[0] is not True:
-                    # Another node failed further upstream
-                    return result
-
-    input_data_all = None
-    try:
-        if current_item not in workflow_lock:
-            workflow_lock[current_item] = threading.Lock()
-        with workflow_lock[current_item]:
-            input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
-            # if client_id is not None:
-            #     server.last_node_id = unique_id
-            #     server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
-
-            obj = object_storage.get((unique_id, class_type), None)
-            if obj is None:
-                obj = class_def()
-                object_storage[(unique_id, class_type)] = obj
-
-            output_data, output_ui = execution.get_output_data(obj, input_data_all)
-            outputs[unique_id] = output_data
-        if len(output_ui) > 0:
-            outputs_ui[unique_id] = output_ui
-            if client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
-    except comfy.model_management.InterruptProcessingException as iex:
-        logging.info("Processing interrupted")
-
-        # skip formatting inputs/outputs
-        error_details = {
-            "node_id": unique_id,
-        }
-
-        return (False, error_details, iex)
-    except Exception as ex:
-        typ, _, tb = sys.exc_info()
-        exception_type = execution.full_type_name(typ)
-        input_data_formatted = {}
-        if input_data_all is not None:
-            input_data_formatted = {}
-            for name, inputs in input_data_all.items():
-                input_data_formatted[name] = [execution.format_value(x) for x in inputs]
-
-        output_data_formatted = {}
-        for node_id, node_outputs in outputs.items():
-            output_data_formatted[node_id] = [[execution.format_value(x) for x in l] for l in node_outputs]
-
-        logging.error(f"!!! Exception during processing!!! {ex}")
-        logging.error(traceback.format_exc())
-
-        error_details = {
-            "node_id": unique_id,
-            "exception_message": str(ex),
-            "exception_type": exception_type,
-            "traceback": traceback.format_tb(tb),
-            "current_inputs": input_data_formatted,
-            "current_outputs": output_data_formatted
-        }
-        return (False, error_details, ex)
-
-    executed.add(unique_id)
-
-    return (True, None, None)
-
-def shallow_copy(x: dict):
-    c = {}
-    for k,v in x.items():
-        c[k] = v
-    return c
 
 class PromptExecutor:
     def __init__(self, server: PromptServer):
@@ -121,6 +34,7 @@ class PromptExecutor:
 
         self.status_messages = {} # promptid to message list
         self.success = {} # promptid to message list
+        self.history_profile = {}
     
     def clean_end_execution(self, prompt_id):
         self.status_messages.pop(prompt_id)
@@ -133,7 +47,7 @@ class PromptExecutor:
             self.status_messages[prompt_id] = []
         self.status_messages[prompt_id].append((event, data))
         if client_id is not None or broadcast:
-            self.server.send_sync(event, data, client_id)
+            self.parallel_send_sync(prompt_id, event, data, client_id)
 
     def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex, client_id, outputs, workflow_old_prompt):
         node_id = error["node_id"]
@@ -252,7 +166,7 @@ class PromptExecutor:
                 # This call shouldn't raise anything if there's an error deep in
                 # the actual SD code, instead it will report the node where the
                 # error was raised
-                success, error, ex = pipeline_parallel_recursive_execute(self.server, prompt, prompt_outout, output_node_id, extra_data, executed, prompt_id, 
+                success, error, ex = pipeline_parallel_recursive_execute(self, prompt, prompt_outout, output_node_id, extra_data, executed, prompt_id,
                                                                          outputs_ui, object_storage=workflow_object_storage, workflow_lock=workflow_lock)
                 self.success[prompt_id] = success
                 if not success:
@@ -270,6 +184,23 @@ class PromptExecutor:
                     comfy.model_management.unload_all_models()
         return prompt_outout, outputs_ui
 
+
+    def parallel_send_sync(self, prompt_id, event, data, sid=None):
+        print(f"event: {event}, data: {data}")
+        if prompt_id not in self.history_profile:
+            self.history_profile[prompt_id] = {}
+        CURRENT_START_EXECUTION_DATA = self.history_profile[prompt_id]
+        if event == "execution_start":
+            CURRENT_START_EXECUTION_DATA = dict(
+                start_perf_time=time.perf_counter(),
+                nodes_start_perf_time={}
+            )
+        self.server.send_sync(event=event, data=data, sid=sid)
+
+        if event == "executing" and data and CURRENT_START_EXECUTION_DATA:
+            if data.get("node") is not None:
+                node_id = data.get("node")
+                CURRENT_START_EXECUTION_DATA['nodes_start_perf_time'][node_id] = time.perf_counter()
 
 
 MAXIMUM_HISTORY_SIZE = 10000
@@ -387,5 +318,98 @@ class PromptQueue:
                 return self.flags.copy()
 
 parallel_prompt_queue = PromptQueue()
+
+    
+
+def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, outputs, current_item, extra_data, executed, 
+                                        prompt_id, outputs_ui, object_storage, workflow_lock):
+    client_id = extra_data["client_id"]
+
+    unique_id = current_item
+    inputs = prompt[unique_id]['inputs']
+    class_type = prompt[unique_id]['class_type']
+    class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
+    if unique_id in outputs:
+        return (True, None, None)
+
+    for x in inputs:
+        input_data = inputs[x]
+
+        if isinstance(input_data, list):
+            input_unique_id = input_data[0]
+            output_index = input_data[1]
+            if input_unique_id not in outputs:
+                result = pipeline_parallel_recursive_execute(executor, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, object_storage, workflow_lock)
+                if result[0] is not True:
+                    # Another node failed further upstream
+                    return result
+
+    input_data_all = None
+    try:
+        if current_item not in workflow_lock:
+            workflow_lock[current_item] = threading.Lock()
+        with workflow_lock[current_item]:
+            input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
+            if client_id is not None:
+                executor.parallel_send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
+
+            obj = object_storage.get((unique_id, class_type), None)
+            if obj is None:
+                obj = class_def()
+                object_storage[(unique_id, class_type)] = obj
+
+            output_data, output_ui = execution.get_output_data(obj, input_data_all)
+            outputs[unique_id] = output_data
+        if len(output_ui) > 0:
+            outputs_ui[unique_id] = output_ui
+            if client_id is not None:
+                executor.parallel_send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, client_id)
+    except comfy.model_management.InterruptProcessingException as iex:
+        logging.info("Processing interrupted")
+
+        # skip formatting inputs/outputs
+        error_details = {
+            "node_id": unique_id,
+        }
+
+        return (False, error_details, iex)
+    except Exception as ex:
+        typ, _, tb = sys.exc_info()
+        exception_type = execution.full_type_name(typ)
+        input_data_formatted = {}
+        if input_data_all is not None:
+            input_data_formatted = {}
+            for name, inputs in input_data_all.items():
+                input_data_formatted[name] = [execution.format_value(x) for x in inputs]
+
+        output_data_formatted = {}
+        for node_id, node_outputs in outputs.items():
+            output_data_formatted[node_id] = [[execution.format_value(x) for x in l] for l in node_outputs]
+
+        logging.error(f"!!! Exception during processing!!! {ex}")
+        logging.error(traceback.format_exc())
+
+        error_details = {
+            "node_id": unique_id,
+            "exception_message": str(ex),
+            "exception_type": exception_type,
+            "traceback": traceback.format_tb(tb),
+            "current_inputs": input_data_formatted,
+            "current_outputs": output_data_formatted
+        }
+        return (False, error_details, ex)
+
+    executed.add(unique_id)
+
+    return (True, None, None)
+
+def shallow_copy(x: dict):
+    c = {}
+    for k,v in x.items():
+        c[k] = v
+    return c
+
+
+
 
 
