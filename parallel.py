@@ -10,6 +10,8 @@ import uuid
 from aiohttp import web
 from concurrent.futures import ThreadPoolExecutor, Future
 
+
+
 from server import PromptServer
 import execution
 from . import parallel_execution
@@ -38,39 +40,39 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
     gc_collect_interval = 10.0
 
     while True:
-        timeout = 1000.0
+        timeout = 1.0
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
 
-        queue_item = q.get(timeout=timeout)
-        if queue_item is not None and parallelExecutor._work_queue.qsize() == 0:
-            item, item_id = queue_item
-            prompt_id = item[1]
-            server.last_prompt_id = prompt_id
+        if parallelExecutor._work_queue.qsize() == 0: # wait queue is empty free to execute
+            queue_item = q.get(timeout=timeout)
+            if queue_item is not None: 
+                item, item_id = queue_item
+                prompt_id = item[1]
 
-            first_workflow_prompt = True
-            workflow_name = item[3]["workflow_name"]
-            if workflow_name in e.outputs:
-                first_workflow_prompt = False
+                first_workflow_prompt = True
+                workflow_name = item[3]["workflow_name"]
+                if workflow_name in e.outputs:
+                    first_workflow_prompt = False
 
-            future = parallelExecutor.submit(execute_hook, e, item[2], prompt_id, item[3], item[4])
-        
-            def done_cb(_future: Future, prompt_id=item[1], extra_data = item[3], item_id=item_id):
-                prompt_outout, outputs_ui = _future.result()
-                logging.info(f"done_cb {prompt_id}")
-                q.task_done(item_id,
-                            outputs_ui,
-                            status=parallel_execution.PromptQueue.ExecutionStatus(
-                                status_str='success' if e.success else 'error',
-                                completed=e.success,
-                                messages=e.status_messages))
-                if extra_data.get("client_id") is not None:
-                    server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, extra_data.get("client_id"))
-            future.add_done_callback(done_cb)
-            if first_workflow_prompt:
-                future.result() # first prompt wait for it
-        
-            logging.info(f"currently_running:{len(q.currently_running)}")
+                future = parallelExecutor.submit(execute_hook, e, item[2], prompt_id, item[3], item[4])
+            
+                def done_cb(_future: Future, prompt_id=item[1], extra_data = item[3], item_id=item_id):
+                    prompt_outout, outputs_ui = _future.result()
+                    logging.info(f"done_cb {prompt_id}")
+                    q.task_done(item_id,
+                                outputs_ui,
+                                status=parallel_execution.PromptQueue.ExecutionStatus(
+                                    status_str='success' if e.success else 'error',
+                                    completed=e.success,
+                                    messages=e.status_messages))
+                    if extra_data.get("client_id") is not None:
+                        server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, extra_data.get("client_id"))
+                future.add_done_callback(done_cb)
+                if first_workflow_prompt:
+                    future.result() # first prompt wait for it
+            
+                logging.info(f"currently_running:{len(q.currently_running)}")
 
         if len(q.currently_running) == 0:
             need_gc = True
