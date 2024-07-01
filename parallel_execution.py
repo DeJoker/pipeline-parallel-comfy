@@ -167,7 +167,7 @@ class PromptExecutor:
                 # the actual SD code, instead it will report the node where the
                 # error was raised
                 success, error, ex = pipeline_parallel_recursive_execute(self, prompt, prompt_outout, output_node_id, extra_data, executed, prompt_id,
-                                                                         outputs_ui, object_storage=workflow_object_storage, workflow_lock=workflow_lock)
+                                                                         outputs_ui, object_storage=workflow_object_storage, workflow_lock=workflow_lock, CURRENT_START_EXECUTION_DATA = self.history_profile[prompt_id])
                 self.success[prompt_id] = success
                 if not success:
                     self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex, client_id, workflow_outputs, workflow_old_prompt)
@@ -186,10 +186,11 @@ class PromptExecutor:
 
 
     def parallel_send_sync(self, prompt_id, event, data, sid=None):
-        print(f"event: {event}, data: {data}")
+        # print(f"{prompt_id} event: {event}, data: {data}")
         if prompt_id not in self.history_profile:
             self.history_profile[prompt_id] = {}
         CURRENT_START_EXECUTION_DATA = self.history_profile[prompt_id]
+
         if event == "execution_start":
             CURRENT_START_EXECUTION_DATA = dict(
                 start_perf_time=time.perf_counter(),
@@ -201,6 +202,7 @@ class PromptExecutor:
             if data.get("node") is not None:
                 node_id = data.get("node")
                 CURRENT_START_EXECUTION_DATA['nodes_start_perf_time'][node_id] = time.perf_counter()
+        self.history_profile[prompt_id] = CURRENT_START_EXECUTION_DATA
 
 
 MAXIMUM_HISTORY_SIZE = 10000
@@ -322,7 +324,7 @@ parallel_prompt_queue = PromptQueue()
     
 
 def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, outputs, current_item, extra_data, executed, 
-                                        prompt_id, outputs_ui, object_storage, workflow_lock):
+                                        prompt_id, outputs_ui, object_storage, workflow_lock, CURRENT_START_EXECUTION_DATA):
     client_id = extra_data["client_id"]
 
     unique_id = current_item
@@ -339,7 +341,8 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
             input_unique_id = input_data[0]
             output_index = input_data[1]
             if input_unique_id not in outputs:
-                result = pipeline_parallel_recursive_execute(executor, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, object_storage, workflow_lock)
+                result = pipeline_parallel_recursive_execute(executor, prompt, outputs, input_unique_id, extra_data, executed, prompt_id,
+                                                             outputs_ui, object_storage=object_storage, workflow_lock=workflow_lock, CURRENT_START_EXECUTION_DATA=CURRENT_START_EXECUTION_DATA)
                 if result[0] is not True:
                     # Another node failed further upstream
                     return result
@@ -351,7 +354,7 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
         with workflow_lock[current_item]:
             input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
             if client_id is not None:
-                executor.parallel_send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
+                executor.parallel_send_sync(prompt_id, "executing", { "node": unique_id, "prompt_id": prompt_id }, client_id)
 
             obj = object_storage.get((unique_id, class_type), None)
             if obj is None:
@@ -363,7 +366,7 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
         if len(output_ui) > 0:
             outputs_ui[unique_id] = output_ui
             if client_id is not None:
-                executor.parallel_send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, client_id)
+                executor.parallel_send_sync(prompt_id, "executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, client_id)
     except comfy.model_management.InterruptProcessingException as iex:
         logging.info("Processing interrupted")
 
@@ -400,6 +403,12 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
         return (False, error_details, ex)
 
     executed.add(unique_id)
+    if CURRENT_START_EXECUTION_DATA:
+        start_time = CURRENT_START_EXECUTION_DATA['nodes_start_perf_time'].get(unique_id)
+        if start_time:
+            end_time = time.perf_counter()
+            execution_time = end_time - start_time
+            logging.info(f"{prompt_id} #{unique_id} [{class_type}]: {execution_time:.2f}s")
 
     return (True, None, None)
 
