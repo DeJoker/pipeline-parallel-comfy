@@ -113,7 +113,11 @@ class PromptExecutor:
 
         with torch.inference_mode():
             with self.locks[workflow_name]["workflow_lock"]:
-                workflow_outputs = self.outputs[workflow_name]
+                workflow_object_storage = shallow_copy(self.object_storages[workflow_name])
+                workflow_old_prompt = shallow_copy(self.old_prompts[workflow_name])
+                workflow_lock = self.locks[workflow_name]
+
+                workflow_outputs = shallow_copy(self.outputs[workflow_name])
                 #delete cached outputs if nodes don't exist for them
                 to_delete = []
                 for o in workflow_outputs:
@@ -135,6 +139,8 @@ class PromptExecutor:
                     del d
 
                 for x in prompt:
+                    if x not in workflow_lock:
+                        workflow_lock[x] = threading.Lock()
                     execution.recursive_output_delete_if_changed(prompt, workflow_old_prompt, workflow_outputs, x)
 
                 current_outputs = set(workflow_outputs.keys())
@@ -176,8 +182,9 @@ class PromptExecutor:
             with self.locks[workflow_name]["workflow_lock"]:
                 self.outputs[workflow_name] = prompt_outout
             
-            for x in executed:
-                workflow_old_prompt[x] = copy.deepcopy(prompt[x])
+                for x in executed:
+                    workflow_old_prompt[x] = copy.deepcopy(prompt[x])
+                self.old_prompts[workflow_name] = workflow_old_prompt
             # self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 with self.cleanup_lock:
@@ -349,8 +356,6 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
 
     input_data_all = None
     try:
-        if current_item not in workflow_lock:
-            workflow_lock[current_item] = threading.Lock()
         with workflow_lock[current_item]:
             input_data_all = execution.get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
             if client_id is not None:
@@ -415,10 +420,20 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
 def shallow_copy(x: dict):
     c = {}
     for k,v in x.items():
-        c[k] = v
+        c[k] = clone_if_tensor(v)
     return c
 
 
-
+def clone_if_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    elif isinstance(value, list):
+        return [clone_if_tensor(v) for v in value]
+    elif isinstance(value, dict):
+        return {k: clone_if_tensor(v) for k, v in value.items()}
+    elif isinstance(value, (int, float, bool, str)):
+        return copy.deepcopy(value)
+    else:
+        return value
 
 

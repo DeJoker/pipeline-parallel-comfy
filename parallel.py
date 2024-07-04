@@ -32,7 +32,7 @@ def execute_hook(e: parallel_execution.PromptExecutor, prompt, prompt_id, extra_
 
 def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
     server.last_prompt_id = '' # add PromptServer attribute when UI or /prompt not do it
-    parallelExecutor = ThreadPoolExecutor(max_workers=4)
+    parallelExecutor = ThreadPoolExecutor(max_workers=6)
 
     e = parallel_execution.PromptExecutor(server)
     last_gc_collect = 0
