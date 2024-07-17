@@ -239,18 +239,24 @@ class PromptQueue:
 
     def get(self, timeout=None):
         with self.not_empty:
-            for workflow_name, queue in self.workflow_queue.items():
-                # queue = self.workflow_queue[workflow_name]
-                while len(queue) == 0:
-                    self.not_empty.wait(timeout=timeout)
-                    if timeout is not None and len(queue) == 0:
-                        return None
-                item = heapq.heappop(queue)
-                i = self.task_counter
-                self.currently_running[i] = copy.deepcopy(item)
-                self.task_counter += 1
-                # self.server.queue_updated()
-                return (item, i)
+            for workflow_name, queue in list(self.workflow_queue.items()):
+                result = self._get_workflow_queue(queue, timeout)
+                if result:
+                    return result
+            return None
+
+    #  call in with self.not_empty
+    def _get_workflow_queue(self, queue, timeout=None):
+        while len(queue) == 0:
+            self.not_empty.wait(timeout=timeout)
+            if timeout is not None and len(queue) == 0:
+                return None
+        item = heapq.heappop(queue)
+        i = self.task_counter
+        self.currently_running[i] = copy.deepcopy(item)
+        self.task_counter += 1
+        # self.server.queue_updated()
+        return (item, i)
 
     class ExecutionStatus(NamedTuple):
         status_str: Literal['success', 'error']

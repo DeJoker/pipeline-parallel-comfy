@@ -20,7 +20,7 @@ number = 0
 
 @routes.post("/parallel/prompt")
 async def post_prompt(request):
-    print("got prompt")
+    print("parallel got prompt")
     resp_code = 200
     json_data = await request.json()
 
