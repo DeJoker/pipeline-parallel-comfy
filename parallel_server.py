@@ -15,8 +15,7 @@ server_inst = PromptServer.instance
 routes = PromptServer.instance.routes
 
 from .parallel_execution import parallel_prompt_queue
-
-number = 0
+from .utils import PipelineConfig, inc_number
 
 @routes.post("/parallel/prompt")
 async def post_prompt(request):
@@ -24,8 +23,7 @@ async def post_prompt(request):
     resp_code = 200
     json_data = await request.json()
 
-    global number
-    number += 1
+    number = inc_number()
 
     if "prompt" not in json_data:
         return web.json_response({"error": "no prompt", "node_errors": []}, status=400)
@@ -45,7 +43,7 @@ async def post_prompt(request):
         prompt_id = str(uuid.uuid4())
         outputs_to_execute = valid[2]
         workflow_name = extra_data["workflow_name"]
-        parallel_prompt_queue.put(workflow_name, (number, prompt_id, prompt, extra_data, outputs_to_execute))
+        parallel_prompt_queue.put(workflow_name, (number, prompt, prompt_id, extra_data, outputs_to_execute))
         response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
         return web.json_response(response)
     else:

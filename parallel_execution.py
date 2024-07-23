@@ -237,10 +237,11 @@ class PromptQueue:
 
     def get(self, timeout=None):
         with self.not_empty:
+            size = len(self.workflow_queue.items())
             for workflow_name, queue in self.workflow_queue.items():
                 # queue = self.workflow_queue[workflow_name]
                 while len(queue) == 0:
-                    self.not_empty.wait(timeout=timeout)
+                    self.not_empty.wait(timeout=timeout/size)
                     if timeout is not None and len(queue) == 0:
                         return None
                 item = heapq.heappop(queue)
@@ -266,7 +267,7 @@ class PromptQueue:
             if status is not None:
                 status_dict = copy.deepcopy(status._asdict())
 
-            self.history[prompt[1]] = {
+            self.history[prompt[2]] = {
                 "prompt": prompt,
                 "outputs": copy.deepcopy(outputs),
                 'status': status_dict,
