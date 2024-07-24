@@ -6,11 +6,12 @@ import sys
 import threading
 import time
 import traceback
+from typing import Optional
 import uuid
 from aiohttp import web
 from concurrent.futures import ThreadPoolExecutor, Future
 from .utils import PipelineConfig, inc_number, from_origin
-
+from .utils import origin_cleanup_models, origin_soft_empty_cache
 
 
 from server import PromptServer
@@ -37,22 +38,38 @@ origin_prompt_execute = execution.PromptExecutor.execute
 
 def search_origin_itemid(prompt_id: str):
     origin_q: execution.PromptQueue = server_instance.prompt_queue
-    origin_q.task_counter-1
+
+    last_item = origin_q.currently_running.get(origin_q.task_counter-1)
+    if last_item and last_item[1] == prompt_id:
+        return last_item[0]
+    
+    for item_id, item in origin_q.currently_running.items():
+        if item[1] == prompt_id:
+            return item_id
+    return None
 
 # prompt, prompt_id, extra_data={}, execute_outputs=[]
 def run_in_parallel_execute(self, *args, **kwargs):
-    print("args:", args)
-    print("kwargs:", kwargs)
     # in main.py prompt_worker() func
+    item_id = search_origin_itemid(args[1])
+    if server_instance.client_id is not None:
+        args[2]["client_id"] = server_instance.client_id
 
-    item_id = search_origin_itemid()
+    args[2]["workflow_name"] = from_origin
     parallel_execution.parallel_prompt_queue.put(from_origin, (item_id,)+args)
 
 execution.PromptExecutor.execute = run_in_parallel_execute
 
 
+origin_prompt_task_done = server_instance.prompt_queue.task_done
+# mock it
+from execution import PromptQueue
+def mock_prompt_task_done(item_id, outputs, status: Optional['PromptQueue.ExecutionStatus']):
+    pass
+
+server_instance.prompt_queue.task_done = mock_prompt_task_done
+
 def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
-    logging.info(f"origin_q {id(server.prompt_queue)}")
     server.last_prompt_id = '' # add PromptServer attribute when UI or /prompt not do it
 
     last_gc_collect = 0
@@ -77,22 +94,21 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
 
                 future = threadExecutor.submit(execute_hook, item[1], prompt_id, item[3], item[4])
             
-                def done_cb(_future: Future, workflow_name=workflow_name, prompt_id=prompt_id, extra_data = item[3], item_id=item_id):
+                def done_cb(_future: Future, _workflow_name=workflow_name, _prompt_id=prompt_id, _extra_data = item[3], _item_id=item_id):
                     prompt_outout, outputs_ui = _future.result()
-                    logging.info(f"done_cb {prompt_id}")
+                    logging.info(f"done_cb {_prompt_id} {_workflow_name} {_item_id}")
                     status=parallel_execution.PromptQueue.ExecutionStatus(
                                     status_str='success' if parallel_executor.success else 'error',
                                     completed=parallel_executor.success,
                                     messages=parallel_executor.status_messages)
                     
-                    if workflow_name == from_origin:
-                        logging.info(f"{item_id} {outputs_ui}")
-                        server.prompt_queue.task_done(item_id, outputs_ui, status=status)
+                    if _workflow_name == from_origin:
+                        origin_prompt_task_done(_item_id, outputs_ui, status=status)
                         server.queue_updated()
                     else:
-                        q.task_done(item_id, outputs_ui, status=status)
-                    if extra_data.get("client_id") is not None:
-                        server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, extra_data.get("client_id"))
+                        q.task_done(_item_id, outputs_ui, status=status)
+                    if _extra_data.get("client_id") is not None:
+                        server.send_sync("executing", { "node": None, "prompt_id": _prompt_id }, _extra_data.get("client_id"))
                 future.add_done_callback(done_cb)
                 if first_workflow_prompt:
                     future.result() # first prompt wait for it
@@ -117,9 +133,9 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
             if need_gc:
                 current_time = time.perf_counter()
                 if (current_time - last_gc_collect) > gc_collect_interval:
-                    comfy.model_management.cleanup_models()
+                    origin_cleanup_models()
                     gc.collect()
-                    comfy.model_management.soft_empty_cache()
+                    origin_soft_empty_cache()
                     last_gc_collect = current_time
                     need_gc = False
 

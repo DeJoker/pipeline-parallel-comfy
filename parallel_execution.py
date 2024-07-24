@@ -14,8 +14,10 @@ import nodes
 import comfy.model_management
 import execution
 from server import PromptServer
+from .utils import origin_cleanup_models
 
 
+# comfy.model_management.unload_all_models
 
 class PromptExecutor:
     def __init__(self, server: PromptServer):
@@ -149,7 +151,7 @@ class PromptExecutor:
                 prompt_outout = shallow_copy(workflow_outputs) 
 
             with self.cleanup_lock:
-                comfy.model_management.cleanup_models(keep_clone_weights_loaded=True)
+                origin_cleanup_models(keep_clone_weights_loaded=True)
 
             self.add_message("execution_cached",
                           { "nodes": list(current_outputs) , "prompt_id": prompt_id},
@@ -172,7 +174,7 @@ class PromptExecutor:
                 # This call shouldn't raise anything if there's an error deep in
                 # the actual SD code, instead it will report the node where the
                 # error was raised
-                success, error, ex = pipeline_parallel_recursive_execute(self, prompt, prompt_outout, output_node_id, extra_data, executed, prompt_id,
+                success, error, ex = parallel_recursive_execute(self, prompt, prompt_outout, output_node_id, extra_data, executed, prompt_id,
                                                                          outputs_ui, object_storage=workflow_object_storage, workflow_lock=workflow_lock, CURRENT_START_EXECUTION_DATA = self.history_profile[prompt_id])
                 self.success[prompt_id] = success
                 if not success:
@@ -240,10 +242,10 @@ class PromptQueue:
             size = len(self.workflow_queue.items())
             for workflow_name, queue in self.workflow_queue.items():
                 # queue = self.workflow_queue[workflow_name]
-                while len(queue) == 0:
+                if len(queue) == 0:
                     self.not_empty.wait(timeout=timeout/size)
                     if timeout is not None and len(queue) == 0:
-                        return None
+                        continue
                 item = heapq.heappop(queue)
                 i = self.task_counter
                 self.currently_running[i] = copy.deepcopy(item)
@@ -331,7 +333,7 @@ parallel_prompt_queue = PromptQueue()
 
     
 
-def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, outputs, current_item, extra_data, executed, 
+def parallel_recursive_execute(executor :PromptExecutor, prompt, outputs, current_item, extra_data, executed, 
                                         prompt_id, outputs_ui, object_storage, workflow_lock, CURRENT_START_EXECUTION_DATA):
     client_id = extra_data["client_id"]
 
@@ -349,7 +351,7 @@ def pipeline_parallel_recursive_execute(executor :PromptExecutor, prompt, output
             input_unique_id = input_data[0]
             output_index = input_data[1]
             if input_unique_id not in outputs:
-                result = pipeline_parallel_recursive_execute(executor, prompt, outputs, input_unique_id, extra_data, executed, prompt_id,
+                result = parallel_recursive_execute(executor, prompt, outputs, input_unique_id, extra_data, executed, prompt_id,
                                                              outputs_ui, object_storage=object_storage, workflow_lock=workflow_lock, CURRENT_START_EXECUTION_DATA=CURRENT_START_EXECUTION_DATA)
                 if result[0] is not True:
                     # Another node failed further upstream
