@@ -19,7 +19,7 @@ from .utils import PipelineConfig, inc_number
 
 @routes.post("/parallel/prompt")
 async def post_prompt(request):
-    print("got prompt")
+    print("parallel got prompt")
     resp_code = 200
     json_data = await request.json()
 

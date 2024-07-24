@@ -32,7 +32,7 @@ class PromptExecutor:
         self.cleanup_lock = threading.Lock()
         self.locks = {}
 
-        self.outputs_ui = {} # Not use
+        self.outputs_ui = {}
 
         self.status_messages = {} # promptid to message list
         self.success = {} # promptid to message list
@@ -103,12 +103,14 @@ class PromptExecutor:
             self.outputs[workflow_name] = {}
             self.object_storages[workflow_name] = {}
             self.old_prompts[workflow_name] = {}
+            self.outputs_ui[workflow_name] = {}
             self.locks[workflow_name] = {}
             self.locks[workflow_name]["workflow_lock"] = threading.Lock()
             
         workflow_object_storage = self.object_storages[workflow_name]
         workflow_old_prompt = self.old_prompts[workflow_name]
         workflow_lock = self.locks[workflow_name]
+        outputs_ui = self.outputs_ui[workflow_name]
 
         # self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False, client_id=client_id)
@@ -164,7 +166,6 @@ class PromptExecutor:
                 to_execute += [(0, node_id)]
 
             
-            outputs_ui = {}
             while len(to_execute) > 0:
                 #always execute the output that depends on the least amount of unexecuted nodes first
                 memo = {}
@@ -183,6 +184,7 @@ class PromptExecutor:
 
             with self.locks[workflow_name]["workflow_lock"]:
                 self.outputs[workflow_name] = prompt_outout
+                self.outputs_ui[workflow_name] = outputs_ui
             
                 for x in executed:
                     workflow_old_prompt[x] = copy.deepcopy(prompt[x])
@@ -252,6 +254,7 @@ class PromptQueue:
                 self.task_counter += 1
                 # self.server.queue_updated()
                 return (item, i)
+
 
     class ExecutionStatus(NamedTuple):
         status_str: Literal['success', 'error']

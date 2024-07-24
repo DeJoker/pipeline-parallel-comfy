@@ -77,9 +77,9 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
     gc_collect_interval = 10.0
 
     while True:
-        timeout = 1.0
+        timeout = 0.1
         if need_gc:
-            timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+            timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.1)
 
         if len(q.currently_running) < threadExecutor._max_workers: # wait queue is empty free to execute
             queue_item = q.get(timeout=timeout)
