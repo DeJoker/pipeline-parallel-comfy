@@ -1,9 +1,6 @@
 import os
 from threading import Lock
 
-import logging
-logging.getLogger().addFilter(lambda rec: "send error:" in rec.message)
-
 class PipelineConfig:
     threads_count = max(os.environ.get('COMFY_PIPLELINE_THREADS', 6), 1)
     model_count = os.environ.get('COMFY_PIPLELINE_MODEL_COUNT', 1) # parallel run model at same time

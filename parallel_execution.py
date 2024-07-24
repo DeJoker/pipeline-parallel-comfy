@@ -20,6 +20,8 @@ from .utils import origin_cleanup_models
 # comfy.model_management.unload_all_models
 
 class PromptExecutor:
+    log_filter = False
+
     def __init__(self, server: PromptServer):
         self.server = server
         self.reset()
@@ -93,6 +95,10 @@ class PromptExecutor:
             del d
 
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        if not self.log_filter:
+            logging.getLogger().addFilter(lambda rec: "send error" not in rec.getMessage()) # add after basicConfig
+            self.log_filter = True
+
         nodes.interrupt_processing(False)
 
         client_id = extra_data["client_id"]

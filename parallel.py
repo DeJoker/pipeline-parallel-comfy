@@ -52,6 +52,8 @@ def search_origin_itemid(prompt_id: str):
 def run_in_parallel_execute(self, *args, **kwargs):
     # in main.py prompt_worker() func
     item_id = search_origin_itemid(args[1])
+    if args[2] is None:
+        args[2] = {}
     if server_instance.client_id is not None:
         args[2]["client_id"] = server_instance.client_id
 
@@ -142,7 +144,8 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
 
 threading.Thread(target=prompt_worker, 
                     args=(parallel_execution.parallel_prompt_queue, server_instance,),
-                    daemon=True, 
+                    daemon=True,
+                    name="parallel_prompt_worker"
                 ).start()
 
 
