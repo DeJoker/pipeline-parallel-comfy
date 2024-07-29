@@ -62,6 +62,22 @@ def run_in_parallel_execute(self, *args, **kwargs):
 
 execution.PromptExecutor.execute = run_in_parallel_execute
 
+origin_put = execution.PromptQueue.put
+def put_parallel(self, item):
+    if item[3] is None:
+        item[3] = {}
+    if server_instance.client_id is not None:
+        item[3]["client_id"] = server_instance.client_id
+
+    item[3]["workflow_name"] = from_origin
+    parallel_execution.parallel_prompt_queue.put(from_origin, item)
+execution.PromptQueue.put = put_parallel
+
+origin_get = execution.PromptQueue.get
+def mock_get(self, timeout):
+    while True:
+        time.sleep(1)
+execution.PromptQueue.get = mock_get
 
 origin_prompt_task_done = server_instance.prompt_queue.task_done
 # mock it
@@ -87,14 +103,15 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
             queue_item = q.get(timeout=timeout)
             if queue_item is not None:
                 item, item_id = queue_item
-                prompt_id = item[2]
+                prompt_id = item[1]
 
                 first_workflow_prompt = True
                 workflow_name = item[3]["workflow_name"]
                 if workflow_name in parallel_executor.outputs:
                     first_workflow_prompt = False
+                
 
-                future = threadExecutor.submit(execute_hook, item[1], prompt_id, item[3], item[4])
+                future = threadExecutor.submit(execute_hook, item[2], prompt_id, item[3], item[4])
             
                 def done_cb(_future: Future, _workflow_name=workflow_name, _prompt_id=prompt_id, _extra_data = item[3], _item_id=item_id):
                     prompt_outout, outputs_ui = _future.result()

@@ -43,7 +43,7 @@ async def post_prompt(request):
         prompt_id = str(uuid.uuid4())
         outputs_to_execute = valid[2]
         workflow_name = extra_data["workflow_name"]
-        parallel_prompt_queue.put(workflow_name, (number, prompt, prompt_id, extra_data, outputs_to_execute))
+        parallel_prompt_queue.put(workflow_name, (number, prompt_id, prompt, extra_data, outputs_to_execute))
         response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
         return web.json_response(response)
     else:
