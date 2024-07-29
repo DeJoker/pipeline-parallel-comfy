@@ -19,9 +19,8 @@ import execution
 from . import parallel_execution
 import nodes
 import comfy.model_management
+from .utils import server_instance
 
-routes = PromptServer.instance.routes
-server_instance = PromptServer.instance
 parallel_executor = parallel_execution.PromptExecutor(server_instance)
 threadExecutor = ThreadPoolExecutor(max_workers=PipelineConfig.threads_count)
 
@@ -62,7 +61,6 @@ def run_in_parallel_execute(self, *args, **kwargs):
 
 execution.PromptExecutor.execute = run_in_parallel_execute
 
-origin_put = execution.PromptQueue.put
 def put_parallel(self, item):
     if item[3] is None:
         item[3] = {}
@@ -73,11 +71,6 @@ def put_parallel(self, item):
     parallel_execution.parallel_prompt_queue.put(from_origin, item)
 execution.PromptQueue.put = put_parallel
 
-origin_get = execution.PromptQueue.get
-def mock_get(self, timeout):
-    while True:
-        time.sleep(1)
-execution.PromptQueue.get = mock_get
 
 origin_prompt_task_done = server_instance.prompt_queue.task_done
 # mock it
@@ -99,7 +92,7 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.1)
 
-        if len(q.currently_running) < threadExecutor._max_workers: # wait queue is empty free to execute
+        if q.running_counter < threadExecutor._max_workers: # wait queue is empty free to execute
             queue_item = q.get(timeout=timeout)
             if queue_item is not None:
                 item, item_id = queue_item
@@ -110,7 +103,6 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
                 if workflow_name in parallel_executor.outputs:
                     first_workflow_prompt = False
                 
-
                 future = threadExecutor.submit(execute_hook, item[2], prompt_id, item[3], item[4])
             
                 def done_cb(_future: Future, _workflow_name=workflow_name, _prompt_id=prompt_id, _extra_data = item[3], _item_id=item_id):
@@ -132,9 +124,9 @@ def prompt_worker(q: parallel_execution.PromptQueue, server: PromptServer):
                 if first_workflow_prompt:
                     future.result() # first prompt wait for it
             
-                logging.info(f"currently_running:{len(q.currently_running)}")
+                logging.info(f"currently_running:{q.running_counter}")
 
-        if len(q.currently_running) == 0:
+        if q.running_counter == 0:
             need_gc = True
             flags = q.get_flags()
             free_memory = flags.get("free_memory", False)

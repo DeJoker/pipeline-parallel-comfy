@@ -14,7 +14,7 @@ import nodes
 import comfy.model_management
 import execution
 from server import PromptServer
-from .utils import origin_cleanup_models
+from .utils import origin_cleanup_models, origin_promptQueue, from_origin, origin_put, origin_get
 
 
 # comfy.model_management.unload_all_models
@@ -231,12 +231,17 @@ class PromptQueue:
         self.not_empty = threading.Condition(self.mutex)
         self.task_counter = 0
         self.workflow_queue = {} #  workflow to list
+        self.running_counter = 0
         self.currently_running = {}
         self.history = {}
         self.flags = {}
         # server.prompt_queue = self
 
     def put(self, workflow_name, item):
+        if workflow_name == from_origin:
+            origin_put(origin_promptQueue, item)
+            return
+        
         with self.mutex:
             if workflow_name not in self.workflow_queue:
                 self.workflow_queue[workflow_name] = []
@@ -245,18 +250,24 @@ class PromptQueue:
             # self.server.queue_updated()
             self.not_empty.notify()
 
-    def get(self, timeout=None):
+    def get(self, timeout=0.0):
         with self.not_empty:
-            size = len(self.workflow_queue.items())
+            size = len(self.workflow_queue.items())+1
+            queue_item = origin_get(origin_promptQueue, timeout/size)
+            if queue_item is not None:
+                self.running_counter += 1
+                return queue_item
+
             for workflow_name, queue in self.workflow_queue.items():
                 # queue = self.workflow_queue[workflow_name]
                 if len(queue) == 0:
                     self.not_empty.wait(timeout=timeout/size)
-                    if timeout is not None and len(queue) == 0:
+                    if len(queue) == 0:
                         continue
                 item = heapq.heappop(queue)
                 i = self.task_counter
                 self.currently_running[i] = copy.deepcopy(item)
+                self.running_counter += 1
                 self.task_counter += 1
                 # self.server.queue_updated()
                 return (item, i)
@@ -270,6 +281,7 @@ class PromptQueue:
     def task_done(self, item_id, outputs,
                   status: Optional['PromptQueue.ExecutionStatus']):
         with self.mutex:
+            self.running_counter -= 1
             prompt = self.currently_running.pop(item_id)
             if len(self.history) > MAXIMUM_HISTORY_SIZE:
                 self.history.pop(next(iter(self.history)))

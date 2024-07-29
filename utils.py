@@ -1,11 +1,17 @@
 import os
+import time
 from threading import Lock
+import execution
 
 class PipelineConfig:
     threads_count = max(os.environ.get('COMFY_PIPLELINE_THREADS', 6), 1)
     model_count = os.environ.get('COMFY_PIPLELINE_MODEL_COUNT', 1) # parallel run model at same time
     low_mem = True # if vram not capacitate for more model don't alloc
 
+
+from server import PromptServer
+server_instance = PromptServer.instance
+origin_promptQueue = execution.PromptQueue(server_instance)
 
 import comfy.model_management
 
@@ -19,6 +25,15 @@ origin_soft_empty_cache = comfy.model_management.soft_empty_cache
 def mock_soft_empty_cache(force=False):
     pass
 comfy.model_management.soft_empty_cache = mock_soft_empty_cache
+
+
+origin_put = execution.PromptQueue.put
+
+origin_get = execution.PromptQueue.get
+def mock_get(self, timeout):
+    while True:
+        time.sleep(1)
+execution.PromptQueue.get = mock_get
 
 # don't need mock comfy.model_management.unload_all_models
 
